@@ -1,0 +1,25 @@
+# SnapRecall backend runtime dependencies
+# Lower bounds are tested minimums. After your first successful install, run
+# `pip freeze > requirements.lock` and commit it for reproducible builds.
+
+# API
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30
+pydantic>=2.8,<3.0
+pydantic-settings>=2.4
+
+# Talking to the local Ollama server (Gemma vision + embeddings)
+httpx>=0.27
+
+# Folder watching for new screenshots
+watchdog>=5.0
+
+# Image loading, downscaling, thumbnails
+pillow>=10.4
+
+# OCR (needs the Tesseract binary installed on the system, see README)
+pytesseract>=0.3.13
+
+# Vector search inside SQLite
+sqlite-vec>=0.1.6
+numpy>=1.26
