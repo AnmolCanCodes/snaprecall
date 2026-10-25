@@ -5,7 +5,7 @@
 # API
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.30
-pydantic>=2.8,<3.0
+pydantic-settings>=2.7
 pydantic-settings>=2.4
 
 # Talking to the local Ollama server (Gemma vision + embeddings)
