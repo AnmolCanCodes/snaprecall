@@ -1,0 +1,77 @@
+:root {
+  color-scheme: light dark;
+
+  --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, 'Noto Sans', 'Noto Sans Devanagari',
+    Ubuntu, Cantarell, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+
+  --radius-s: 6px;
+  --radius-m: 10px;
+  --radius-l: 16px;
+
+  --color-bg: #f5f6f8;
+  --color-surface: #ffffff;
+  --color-surface-2: #eceef2;
+  --color-text: #1a1d21;
+  --color-muted: #566170;
+  --color-border: #d6dae1;
+  --color-accent: #2563eb;
+  --color-accent-text: #ffffff;
+  --color-focus: #2563eb;
+
+  --color-info-bg: #eaf1ff;
+  --color-info-border: #b7cdfa;
+  --color-info-text: #1c3a7a;
+  --color-warn-bg: #fff6e0;
+  --color-warn-border: #f0c36d;
+  --color-warn-text: #5c3d00;
+  --color-danger-bg: #fdecec;
+  --color-danger-border: #f0a8a8;
+  --color-danger-text: #7a1111;
+
+  --color-mark-bg: #ffe58a;
+  --color-mark-text: #1a1d21;
+  --color-overlay: rgb(10 14 20 / 0.62);
+
+  --shadow-1: 0 1px 2px rgb(16 24 40 / 0.06), 0 1px 3px rgb(16 24 40 / 0.1);
+  --shadow-2: 0 8px 24px rgb(16 24 40 / 0.14);
+  --transition: 150ms ease;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #0e1115;
+    --color-surface: #171b21;
+    --color-surface-2: #222830;
+    --color-text: #e8ebef;
+    --color-muted: #9aa5b1;
+    --color-border: #2c343e;
+    --color-accent: #7aa7ff;
+    --color-accent-text: #0b1220;
+    --color-focus: #8db4ff;
+
+    --color-info-bg: #16233d;
+    --color-info-border: #2f4a80;
+    --color-info-text: #bcd2ff;
+    --color-warn-bg: #2d2411;
+    --color-warn-border: #6e5518;
+    --color-warn-text: #f3d994;
+    --color-danger-bg: #331818;
+    --color-danger-border: #7a3030;
+    --color-danger-text: #f6b9b9;
+
+    --color-mark-bg: #6b5600;
+    --color-mark-text: #fff4c2;
+    --color-overlay: rgb(0 0 0 / 0.7);
+
+    --shadow-1: 0 1px 2px rgb(0 0 0 / 0.4);
+    --shadow-2: 0 8px 24px rgb(0 0 0 / 0.5);
+  }
+}
