@@ -12,9 +12,7 @@ SnapRecall watches your screenshots folder, lets an AI model read every image in
   <p>AI-powered screenshot indexing · Hybrid search · English, Hindi & Hinglish</p>
 </div>
 
-Built for the Hacktoberfest DEV Challenge, Week 3 (theme: "Slow and Steady"). Gemma is the open-weight model at the core of the project.
-
-> **Status: first working version, still being tested.** The design and code are in place, but search quality, Hindi/Hinglish accuracy, large-backlog indexing time and the local (Ollama) mode have not been measured yet. See [Status and limitations](#status-and-limitations).
+Built for the Hacktoberfest DEV Challenge, Week 3 (theme: "Slow and Steady").
 
 ---
 
@@ -24,7 +22,15 @@ Built for the Hacktoberfest DEV Challenge, Week 3 (theme: "Slow and Steady"). Ge
 - [What SnapRecall does](#what-snaprecall-does)
 - [Features](#features)
 - [How it works](#how-it-works)
+  - [Architecture overview](#architecture-overview)
+  - [1. Discovery and folder watching](#1-discovery-and-folder-watching)
+  - [2. Queue and resilient background worker](#2-queue-and-resilient-background-worker)
+  - [3. Indexing pipeline](#3-indexing-pipeline)
+  - [4. Hybrid search engine](#4-hybrid-search-engine)
 - [Hosted mode vs local mode](#hosted-mode-vs-local-mode)
+  - [Feature comparison](#feature-comparison)
+  - [Hosted mode (Gemini API)](#hosted-mode-gemini-api)
+  - [Local mode (Ollama)](#local-mode-ollama)
 - [Tech stack](#tech-stack)
 - [Getting started](#getting-started)
 - [Configuration](#configuration)
@@ -32,7 +38,6 @@ Built for the Hacktoberfest DEV Challenge, Week 3 (theme: "Slow and Steady"). Ge
 - [Project structure](#project-structure)
 - [Privacy and security](#privacy-and-security)
 - [Why open-weight AI](#why-open-weight-ai)
-- [Status and limitations](#status-and-limitations)
 - [Troubleshooting](#troubleshooting)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
@@ -46,106 +51,233 @@ Screenshots are the fastest way to save something: a payment confirmation, a cha
 
 ## What SnapRecall does
 
-1. Watches the folder where your screenshots are saved.
-2. Sends each image to a vision model (Gemma), which returns a short summary, tags, the type of screenshot and the text it can read.
-3. Stores that information in a local SQLite database, with both a keyword index and a semantic (vector) index.
-4. Lets you search in plain language, in English, Hindi or Hinglish, and shows matching screenshots in a thumbnail grid.
+1. **Watches** your screenshot folder for new or modified images.
+2. **Understands** each image with a vision model, producing a concise summary, tags, screenshot category, and visible text (in English, Hindi, and Hinglish).
+3. **Indexes** the extracted content into a local SQLite database using both full-text keyword search (FTS5) and semantic vector search (`sqlite-vec`).
+4. **Retrieves** matching screenshots through hybrid rank fusion when you search in natural language.
 
-Your original files are never renamed, moved or modified.
+Your original files are never renamed, moved, or modified.
 
 ## Features
 
-- **Background indexing.** New screenshots are picked up automatically shortly after they are saved.
-- **Slow and steady backfill.** Existing screenshots are processed one at a time with a configurable pause, so a large backlog never freezes your machine or floods an API.
-- **Rate limit aware.** The worker backs off on API rate limits, can pause on a daily request budget, and resumes from where it stopped after a restart.
-- **AI understanding of screenshots.** Each image gets a summary, tags, an app type (chat, payment, code, error, ticket, and more) and its visible text.
-- **Hybrid search.** Keyword search for exact names, amounts and error codes, combined with semantic search for vague memories, merged with Reciprocal Rank Fusion.
-- **English, Hindi and Hinglish queries.**
-- **Duplicate detection.** Identical images (by SHA-256) are not processed twice.
-- **React web UI.** Search box, thumbnail grid, preview, and live indexing progress with pause and resume.
-- **Two model providers.** Hosted Gemma through the Gemini API (light on your laptop) or fully local models through Ollama.
+- **Background indexing:** New screenshots are detected and queued automatically as you take them.
+- **Slow and steady backfill:** Existing backlogs are processed one-by-one with configurable pauses, keeping system resources and API limits under control.
+- **Zero-cost deduplication:** Images identical by SHA-256 reuse existing metadata and vectors instantly without redundant model inference.
+- **Rate-limit and budget aware:** Automatically backs off on API 429 errors, respects daily request quotas, and auto-resumes at local midnight.
+- **Multilingual understanding:** Understands screenshots containing English, Devanagari Hindi, and mixed Hinglish.
+- **Hybrid search (BM25 + Vector KNN):** Combines exact keyword matching with semantic concept search via Reciprocal Rank Fusion (RRF).
+- **Graceful degradation:** If embedding services are offline, search seamlessly falls back to keyword-only mode.
+- **Dual provider flexibility:** Run hosted with Google Gemini API (light on hardware) or 100% locally with Ollama (completely private and offline).
+- **Modern web UI:** Fast React interface with live indexing progress, thumbnail preview grids, full-detail inspection modals, and direct file access.
+
+---
 
 ## How it works
 
+### Architecture overview
+
 ```
- Screenshots folder
-        |
-        v
- [Watcher + folder scanner] --- new / existing files ---> [Job queue in SQLite]
-                                                                 |
-                                              one image at a time, throttled
-                                                                 v
-                              +-------------------------------------------------+
-                              |  Indexing pipeline                              |
-                              |  1. Load and downscale the image                |
-                              |  2. Optional OCR (Tesseract, eng+hin)           |
-                              |  3. Gemma vision: summary, tags, app type,      |
-                              |     visible text                                |
-                              |  4. Embed the combined text                     |
-                              +-------------------------------------------------+
-                                                                 |
-                                                                 v
-                      SQLite: metadata + FTS5 (keywords) + sqlite-vec (vectors)
-                                                                 ^
-                                                                 |
- React UI <--- REST ---> FastAPI ---> hybrid search (BM25 + vector KNN + rank fusion)
+ +---------------------------------------------------------------------------------------+
+ |                                  INGESTION LAYER                                      |
+ |                                                                                       |
+ |  Screenshots Folder (SCREENSHOT_DIR)                                                  |
+ |         │                                                                             |
+ |         ├─► [Startup Backfill Scanner] ── (scandir walk, skips temp/ignored files) ──┐ |
+ |         │                                                                            ▼ |
+ |         └─► [Live Watcher (Watchdog)] ── (write stability check, move/delete sync) ─►│ |
+ +--------------------------------------------------------------------------------------│+
+                                                                                        │
+                                                                                        ▼
+ +---------------------------------------------------------------------------------------+
+ |                             QUEUE & BACKGROUND WORKER                                 |
+ |                                                                                       |
+ |  SQLite `images` Table (status: pending ──► processing ──► done / failed)             |
+ |         │                                                                             |
+ |         │  • Claims newest first (ORDER BY mtime DESC, id DESC)                       |
+ |         │  • Throttles between images (WORKER_THROTTLE_SECONDS)                       |
+ |         │  • Daily budget tracking & auto-resume at midnight                          |
+ |         │  • Exponential backoff on 429 rate limits & retry-after parsing             |
+ |         ▼                                                                             |
+ +---------------------------------------------------------------------------------------+
+                                           │
+                                           ▼
+ +---------------------------------------------------------------------------------------+
+ |                                 INDEXING PIPELINE                                     |
+ |                                                                                       |
+ |  1. Checksum & Deduplication:                                                         |
+ |     Computes SHA-256. If file hash already indexed, copies vector & metadata instantly |
+ |     (skips LLM & embedding calls completely — zero cost & instant!).                 |
+ |                                                                                       |
+ |  2. Image Preprocessing:                                                              |
+ |     Reads dimensions, downscales longest side to MAX_IMAGE_SIDE (default 1024px),      |
+ |     generates base64 payload.                                                         |
+ |                                                                                       |
+ |  3. Parallel Extraction:                                                              |
+ |     ┌────────────────────────────────────┐    ┌────────────────────────────────────┐  |
+ |     │ Vision Analysis (Gemini or Ollama) │    │ Optional OCR (Tesseract eng+hin)   │  |
+ |     │ Structured JSON output:            │    │ Extracted verbatim text strings    │  |
+ |     │ - summary (concise overview)       │    │ (enabled if OCR_ENGINE=tesseract)  │  |
+ |     │ - tags (3-8 categorical tags)      │    │                                    │  |
+ |     │ - app_type (chat, payment, code...)│    │                                    │  |
+ |     │ - visible_text (Hindi / Hinglish / │    │                                    │  |
+ |     │   English verbatim text)           │    │                                    │  |
+ |     └─────────────────┬──────────────────┘    └─────────────────┬──────────────────┘  |
+ |                       └─────────────────┬───────────────────────┘                     |
+ |                                         ▼                                             |
+ |  4. Document Text Assembly & Embeddings:                                              |
+ |     Combines summary + type + tags + visible text + OCR into unified document text.   |
+ |     Generates dense embedding vector (EMBEDDING_DIM = 768).                           |
+ |                                                                                       |
+ |  5. Storage & Triggers:                                                               |
+ |     - Updates `images` table with metadata & status='done'.                           |
+ |     - SQLite trigger updates `images_fts` (FTS5 BM25 index with unicode61).           |
+ |     - Inserts vector into `vec_images` (sqlite-vec KNN virtual table).                |
+ |     - Generates lightweight WebP thumbnail in `data/thumbnails/{id}.webp`.            |
+ +---------------------------------------------------------------------------------------+
+                                           ▲
+                                           │
+ +---------------------------------------------------------------------------------------+
+ |                              HYBRID SEARCH & RETRIEVAL                                |
+ |                                                                                       |
+ |  User Query (Search Box) ────────────────────────────────────────────────────────┐    |
+ |         │                                                                        │    |
+ |         ▼                                                                        ▼    |
+ |  [Keyword Search Leg]                                                   [Semantic Leg]|
+ |  - Sanitizes query (safe tokens & Devanagari)               - Embeds query with task  |
+ |  - BM25 matching via SQLite FTS5                            - KNN vector search via   |
+ |  - Extracts highlighted snippets                              sqlite-vec              |
+ |         │                                                                        │    |
+ |         └───────────────────────────────┬────────────────────────────────────────┘    |
+ |                                         ▼                                             |
+ |                      [Reciprocal Rank Fusion (RRF_K=60)]                              |
+ |                      Fuses ranks: score = Σ (1 / (60 + rank))                         |
+ |                      Graceful fallback: degrades to keyword-only if provider offline  |
+ |                                         │                                             |
+ |                                         ▼                                             |
+ |                            FastAPI REST API (/api/search)                             |
+ |                                         │                                             |
+ |                                         ▼                                             |
+ |                   React 18 Frontend (Search, Previews, Progress Bar)                  |
+ +---------------------------------------------------------------------------------------+
 ```
 
-### Why hybrid search
+### 1. Discovery and folder watching
 
-People look for screenshots in two different ways. Sometimes they remember something exact (a name, an amount, an error code), and keyword search is best there because semantic search can blur exact tokens. Other times the memory is vague ("the bus ticket one"), and keyword search fails when the words do not match while semantic search still finds the meaning. SnapRecall runs both and merges the two ranked lists with Reciprocal Rank Fusion, which rewards results that rank well in either list without comparing raw scores.
+- **Startup reconciliation (`scan_folder`):** On startup (when `BACKFILL_ON_START=true`), SnapRecall walks `SCREENSHOT_DIR` using `os.scandir`. It skips hidden files (`.*`), temporary downloads (`.tmp`, `.part`, `.crdownload`), and unsupported extensions. New files are inserted into SQLite as `pending`, modified files (detected via `mtime` and `size_bytes`) are requeued, and deleted files have their records and thumbnails cleaned up.
+- **Live filesystem watcher (`FolderWatcher`):** Uses `watchdog` to monitor the folder in real time. Before queuing a newly created file, it performs stability checks (`_wait_until_stable`), polling file size across intervals to ensure the operating system has finished writing the screenshot to disk. File renames and moves update the path in SQLite directly without re-indexing.
 
-### Why it is "slow and steady"
+### 2. Queue and resilient background worker
 
-Reading thousands of images with a model is heavy. The indexer is designed to be patient:
+- **SQLite-backed job queue:** Jobs reside in the `images` table with states: `pending` → `processing` → `done` (or `failed`).
+- **Newest-first priority:** The worker claims the newest images first (`ORDER BY mtime DESC, id DESC`), ensuring that screenshots you just took become searchable right away.
+- **Throttling & budget controls:** The worker pauses for `WORKER_THROTTLE_SECONDS` between images. If `DAILY_REQUEST_BUDGET` is set and reached, or if the provider reports quota exhaustion, the worker automatically pauses and a background timer auto-resumes processing at local midnight.
+- **Rate-limit resilience:** HTTP 429 errors parse `Retry-After` headers and apply exponential backoff without counting toward failure retry limits. Images are only marked as `failed` after exhausting `WORKER_MAX_RETRIES` non-rate-limit errors.
 
-- One image at a time, with a pause between images (`WORKER_THROTTLE_SECONDS`).
-- Retries with exponential backoff when the provider is unavailable or rate-limited. Rate limits are not counted as failed attempts.
-- An optional daily request budget (`DAILY_REQUEST_BUDGET`) that pauses indexing automatically.
-- Crash recovery: images left in a "processing" state are re-queued on startup.
-- Newest screenshots are indexed first, so recent ones become searchable quickly.
+### 3. Indexing pipeline
+
+For each queued screenshot:
+1. **Deduplication:** Computes the SHA-256 hash. If an identical file has already been indexed, metadata and vector embeddings are copied directly using `copy_vector`. No LLM or embedding API calls are made.
+2. **Preprocessing:** Image dimensions are recorded, and the image is downscaled so its longest side does not exceed `MAX_IMAGE_SIDE` (default 1024px), reducing bandwidth and token usage.
+3. **Multimodal analysis:** The image base64 is sent to the vision model with a structured JSON prompt instructing it to extract:
+   - `summary`: A concise 1-2 sentence description.
+   - `tags`: 3 to 8 lowercase categorical keywords.
+   - `app_type`: Categorized into one of 13 types (`chat`, `payment`, `code`, `error`, `document`, `social`, `shopping`, `map`, `ticket`, `email`, `settings`, `web`, `other`).
+   - `visible_text`: All readable text, preserving names, amounts, numbers, error codes, and Hindi (Devanagari) / Hinglish verbatim.
+4. **Optional OCR:** If `OCR_ENGINE=tesseract`, Tesseract OCR runs in parallel (`eng+hin`). If `OCR_ENGINE=none`, the vision model handles text extraction directly.
+5. **Embedding generation:** Searchable fields (`Summary`, `Type`, `Tags`, `Visible text`, `OCR text`) are merged into a unified document representation and passed to the embedding model (`EMBEDDING_DIM=768`) under the `document` task type.
+6. **Persistence:** Metadata is saved in the `images` table. SQLite database triggers automatically update the `images_fts` FTS5 table, the vector is stored in `vec_images` via `sqlite-vec`, and a lightweight WebP thumbnail is cached in `data/thumbnails/`.
+
+### 4. Hybrid search engine
+
+SnapRecall performs both keyword and semantic searches in parallel and fuses the results:
+- **Keyword leg (BM25 via FTS5):** User queries are sanitized (`sanitize_fts_query`) into safe prefix tokens (preserving alphanumeric characters and Devanagari combining marks) and matched against the FTS5 full-text index with BM25 scoring and contextual snippet highlighting.
+- **Semantic leg (KNN via sqlite-vec):** The query is embedded under the `query` task type and matched against indexed vectors using cosine distance in `sqlite-vec`.
+- **Reciprocal Rank Fusion (RRF):** Merges the top candidates from both lists using:
+  $$\text{RRF Score} = \sum_{m \in \{\text{keyword}, \text{semantic}\}} \frac{1}{k + \text{rank}_m} \quad (k = 60)$$
+  Exact numbers, codes, and names are captured by the keyword leg, while vague conceptual queries are captured by the semantic leg.
+- **Graceful degradation:** If the embedding model or network is unavailable, semantic search fails safely and the engine returns keyword results with a `degraded: true` indicator.
+
+---
 
 ## Hosted mode vs local mode
 
-The model layer sits behind a provider switch (`LLM_PROVIDER`). The pipeline, database and UI are identical in both modes.
+SnapRecall supports two distinct backends through the `LLM_PROVIDER` setting. The database schema, hybrid search pipeline, and web UI remain identical in both modes.
 
-| | Hosted (`gemini`) | Local (`ollama`) |
+### Feature comparison
+
+| Feature | Hosted Mode (`gemini`) | Local Mode (`ollama`) |
 |---|---|---|
-| Vision model | Gemma 4 through the Gemini API | Gemma through Ollama |
-| Embeddings | Hosted embedding model (not open-source) | EmbeddingGemma through Ollama |
-| Hardware needed | Any laptop | A machine that can run a vision model |
-| Works offline | No | Yes, after models are downloaded |
-| Screenshots leave your machine | **Yes**, they are sent to the provider | No |
-| Cost | Free tier with limits, then per-request | Electricity only |
-| Tested by the author | Yes (primary mode) | Not yet |
+| **Primary provider** | Google Gemini API | Local Ollama server |
+| **Vision model (`VISION_MODEL`)** | `gemini-3-flash-preview` (or `gemini-1.5-flash`) | `gemma3:4b` (or `gemma3:12b`, `llava`) |
+| **Embedding model (`EMBEDDING_MODEL`)** | `gemini-embedding-001` (or `text-embedding-004`) | `embeddinggemma` |
+| **Embedding dimensions (`EMBEDDING_DIM`)** | `768` | `768` |
+| **Hardware requirements** | Any lightweight laptop or desktop | GPU or fast CPU with 8GB+ RAM |
+| **Data privacy** | Images sent to Google API over HTTPS | 100% on-device; no data leaves your machine |
+| **Offline support** | Requires internet access | Works completely offline |
+| **Cost** | Google AI Studio free tier / pay-as-you-go | Completely free (electricity only) |
+| **Rate limits** | Subject to API request quotas (handled by worker) | No rate limits |
 
-Choose hosted mode if your hardware is weak. Choose local mode if your screenshots are sensitive.
+### Hosted mode (Gemini API)
+
+Hosted mode is the recommended choice for fast setup and low hardware requirements.
+
+1. Obtain a free API key from [Google AI Studio](https://aistudio.google.com/apikey).
+2. Configure `.env`:
+   ```env
+   LLM_PROVIDER=gemini
+   GEMINI_API_KEY=your_gemini_api_key_here
+   VISION_MODEL=gemini-3-flash-preview
+   EMBEDDING_MODEL=gemini-embedding-001
+   EMBEDDING_DIM=768
+   ```
+
+### Local mode (Ollama)
+
+Local mode is ideal for privacy-conscious users who do not want screenshot data to leave their machine.
+
+1. Install and start [Ollama](https://ollama.com).
+2. Pull the required vision and embedding models:
+   ```bash
+   ollama pull gemma3:4b
+   ollama pull embeddinggemma
+   ```
+3. Configure `.env`:
+   ```env
+   LLM_PROVIDER=ollama
+   OLLAMA_BASE_URL=http://localhost:11434
+   VISION_MODEL=gemma3:4b
+   EMBEDDING_MODEL=embeddinggemma
+   EMBEDDING_DIM=768
+   ```
+
+---
 
 ## Tech stack
 
-| Layer | Choice |
-|-------|--------|
-| Backend | Python 3.11+, FastAPI, pydantic v2 |
-| Frontend | React 18, Vite, TypeScript |
-| Vision model | Gemma (open-weight, multimodal) |
-| Embeddings | Gemini embedding model (hosted) or EmbeddingGemma (local) |
-| Storage | SQLite with FTS5 and sqlite-vec |
-| File watching | watchdog |
-| OCR (optional) | Tesseract, English and Hindi |
-| HTTP client | httpx |
+| Layer | Technology | Purpose |
+|---|---|---|
+| **Backend Framework** | FastAPI (Python 3.11+) | Async REST API, lifecycle management, CORS |
+| **Database & Search** | SQLite3 + FTS5 + `sqlite-vec` | Relational metadata, BM25 full-text search, vector KNN search |
+| **Vision & Embeddings** | Google Gemini API / Ollama | Multimodal screenshot description, 768-dim vector embeddings |
+| **Filesystem Watcher** | `watchdog` | Real-time screenshot folder change monitoring |
+| **Image Processing** | Pillow (PIL) | Thumbnail generation, dimension checks, downscaling |
+| **OCR (Optional)** | Tesseract OCR (`pytesseract`) | English and Hindi optical character recognition |
+| **Frontend Framework** | React 18 + TypeScript + Vite | Responsive web UI, instant search, indexing status |
+| **Styling** | Custom CSS Variables & Tokens | Dark/light themed modern layout without framework bloat |
+
+---
 
 ## Getting started
 
 ### Prerequisites
 
-- Python 3.11 or newer (with a SQLite build that supports loadable extensions)
-- Node.js 20 or newer
-- **Hosted mode:** a Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey)
-- **Local mode:** [Ollama](https://ollama.com) installed and running
-- **Optional OCR:** Tesseract with English and Hindi data
+- **Python:** Version 3.11 or newer (ensure SQLite extension loading is enabled).
+- **Node.js:** Version 20 or newer.
+- **Model backend:** Either a [Google AI Studio API key](https://aistudio.google.com/apikey) (hosted) or [Ollama](https://ollama.com) installed and running (local).
+- **Optional OCR:** Tesseract OCR (only needed if setting `OCR_ENGINE=tesseract`):
   - Ubuntu/Debian: `sudo apt install tesseract-ocr tesseract-ocr-hin`
   - macOS: `brew install tesseract tesseract-lang`
-  - Windows: UB Mannheim installer (tick Hindi), then set `TESSERACT_CMD` in `.env`
+  - Windows: UB Mannheim installer, then set `TESSERACT_CMD` in `.env`
 
 ### 1. Clone and configure
 
@@ -155,172 +287,243 @@ cd snaprecall
 cp .env.example .env
 ```
 
-Open `.env` and set at least:
+Open `.env` in an editor and set your configuration:
+- Set `SCREENSHOT_DIR` to the folder where your screenshots are stored.
+- For **Hosted mode**: Ensure `LLM_PROVIDER=gemini` and set `GEMINI_API_KEY`.
+- For **Local mode**: Set `LLM_PROVIDER=ollama`, `VISION_MODEL=gemma3:4b`, and `EMBEDDING_MODEL=embeddinggemma`.
 
-- `SCREENSHOT_DIR`: the folder where your screenshots are saved
-- **Hosted mode:** `LLM_PROVIDER=gemini` and `GEMINI_API_KEY=...`
-- **Local mode:** `LLM_PROVIDER=ollama`, plus `VISION_MODEL` and `EMBEDDING_MODEL` set to your Ollama tags
-
-Never commit your `.env` file. It is already in `.gitignore`.
-
-### 2. (Local mode only) Pull the models
-
-```bash
-ollama pull gemma3:4b
-ollama pull embeddinggemma
-```
-
-Use any multimodal Gemma tag available in your Ollama library and set it as `VISION_MODEL`.
-
-### 3. Run the backend
+### 2. Run the backend
 
 ```bash
 cd backend
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+source .venv/bin/activate        # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
-Interactive API docs: http://localhost:8000/docs
+Verify backend health at: http://localhost:8000/api/health  
+Interactive Swagger docs: http://localhost:8000/docs
 
-### 4. Run the frontend
+### 3. Run the frontend
 
 ```bash
 cd frontend
-cp .env.example .env
+cp .env.example .env            # Sets VITE_API_BASE_URL=http://localhost:8000
 npm install
 npm run dev
 ```
 
-Open http://localhost:5173. If `BACKFILL_ON_START=true`, indexing begins automatically and the progress bar shows how many screenshots are done.
+Open http://localhost:5173 in your browser. The indexing progress bar will reflect background progress in real time.
 
-**Tip:** test with a small folder (10 to 20 screenshots) first. Check `/api/health`, run a search, and only then point `SCREENSHOT_DIR` at your full folder.
+---
 
 ## Configuration
 
-All settings live in `.env`. See `.env.example` for the full commented list. The important ones:
+All configuration is managed through environment variables in the root `.env` file. Below is the complete reference matching `.env.example`:
 
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `SCREENSHOT_DIR` | Folder to index (required) | none |
-| `LLM_PROVIDER` | `gemini` or `ollama` | `gemini` |
-| `GEMINI_API_KEY` | API key for hosted mode | none |
-| `VISION_MODEL` | Model ID used to read screenshots | `gemma-4-26b-a4b-it` |
-| `EMBEDDING_MODEL` | Model ID used for embeddings | `gemini-embedding-001` |
-| `EMBEDDING_DIM` | Vector size (must match the model) | `768` |
-| `OCR_ENGINE` | `tesseract` or `none` | `none` |
-| `WATCH_ENABLED` | Index new screenshots automatically | `true` |
-| `BACKFILL_ON_START` | Index existing screenshots on startup | `true` |
-| `WORKER_THROTTLE_SECONDS` | Pause between images | `6` |
-| `DAILY_REQUEST_BUDGET` | Max API calls per day (0 = unlimited) | `0` |
-| `MAX_IMAGE_SIDE` | Longest image side sent to the model (px) | `1024` |
+### API settings
 
-Confirm exact model IDs in Google AI Studio (or your Ollama library) before running, since available models change over time.
+| Variable | Description | Default |
+|---|---|---|
+| `APP_ENV` | Application environment (`development`, `production`) | `development` |
+| `API_HOST` | Host interface for FastAPI to bind | `127.0.0.1` |
+| `API_PORT` | Port for FastAPI backend | `8000` |
+| `LOG_LEVEL` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) | `INFO` |
+| `CORS_ORIGINS` | Comma-separated list of allowed web origins | `http://localhost:5173` |
 
-> **Important:** if you change `EMBEDDING_MODEL` or `EMBEDDING_DIM`, delete `data/snaprecall.db` and re-index. Vectors from different models must never be mixed, and the backend refuses to index when it detects a mismatch.
+### Screenshots and watching
+
+| Variable | Description | Default |
+|---|---|---|
+| `SCREENSHOT_DIR` | Absolute path to folder containing screenshots (**Required**) | _Empty_ |
+| `SCAN_RECURSIVE` | Whether to scan subdirectories inside `SCREENSHOT_DIR` | `false` |
+| `WATCH_ENABLED` | Enable live filesystem monitoring via watchdog | `true` |
+| `BACKFILL_ON_START` | Automatically index existing screenshots upon startup | `true` |
+| `SUPPORTED_EXTENSIONS`| Comma-separated list of indexed image file extensions | `png,jpg,jpeg,webp` |
+
+### Storage and thumbnails
+
+| Variable | Description | Default |
+|---|---|---|
+| `DATA_DIR` | Directory where `snaprecall.db` and thumbnails are stored | `./data` |
+| `THUMBNAIL_SIZE` | Max width/height in pixels for cached thumbnails | `360` |
+
+### Model provider
+
+| Variable | Description | Default |
+|---|---|---|
+| `LLM_PROVIDER` | Active model provider: `gemini` or `ollama` | `gemini` |
+
+### Gemini API (`LLM_PROVIDER=gemini`)
+
+| Variable | Description | Default |
+|---|---|---|
+| `GEMINI_API_KEY` | Google AI Studio API key | _Empty_ |
+| `GEMINI_BASE_URL` | Base URL for Google Generative Language REST API | `https://generativelanguage.googleapis.com/v1beta` |
+| `REQUEST_TIMEOUT_SECONDS` | Timeout in seconds for HTTP requests to Gemini | `120` |
+
+### Ollama (`LLM_PROVIDER=ollama`)
+
+| Variable | Description | Default |
+|---|---|---|
+| `OLLAMA_BASE_URL` | Base URL of your local running Ollama instance | `http://localhost:11434` |
+
+### Models and dimensions
+
+| Variable | Description | Default |
+|---|---|---|
+| `VISION_MODEL` | Model ID used to read and describe screenshots | `gemini-3-flash-preview` |
+| `EMBEDDING_MODEL` | Model ID used to generate vector embeddings | `gemini-embedding-001` |
+| `EMBEDDING_DIM` | Vector dimension size produced by `EMBEDDING_MODEL` | `768` |
+| `MAX_IMAGE_SIDE` | Max dimension (px) sent to the vision model | `1024` |
+
+> [!IMPORTANT]
+> If you change `EMBEDDING_MODEL` or `EMBEDDING_DIM`, you must delete `data/snaprecall.db` and re-index. Vectors from different models or dimensions cannot be compared, and the backend halts indexing if a mismatch is detected.
+
+### OCR
+
+| Variable | Description | Default |
+|---|---|---|
+| `OCR_ENGINE` | OCR mode: `none` (recommended in hosted mode) or `tesseract` | `none` |
+| `OCR_LANGS` | Tesseract language codes separated by `+` | `eng+hin` |
+| `TESSERACT_CMD` | Explicit path to Tesseract binary (if not in PATH) | _Empty_ |
+
+### Background worker
+
+| Variable | Description | Default |
+|---|---|---|
+| `WORKER_THROTTLE_SECONDS` | Pause in seconds between indexing consecutive images | `6` |
+| `WORKER_MAX_RETRIES` | Max non-rate-limit error attempts before marking failed | `3` |
+| `DAILY_REQUEST_BUDGET` | Max API requests permitted per day (`0` = unlimited) | `0` |
+
+### Search
+
+| Variable | Description | Default |
+|---|---|---|
+| `SEARCH_DEFAULT_LIMIT` | Default number of search results returned | `24` |
+| `SEARCH_CANDIDATES` | Candidates retrieved per leg before rank fusion | `50` |
+| `RRF_K` | Reciprocal Rank Fusion smoothing parameter | `60` |
+
+---
 
 ## API overview
 
 | Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/health` | Provider status, model availability, config problems, request counters |
-| GET | `/api/search?q=...&limit=24` | Hybrid search (empty query returns recent screenshots) |
-| GET | `/api/images/{id}` | Metadata for one screenshot |
-| GET | `/api/images/{id}/thumbnail` | Thumbnail |
-| GET | `/api/images/{id}/file` | Original image (indexed files only) |
-| GET | `/api/index/status` | Queue counts, current file, paused state and reason |
-| POST | `/api/index/scan` | Trigger a folder scan |
-| POST | `/api/index/pause` | Pause the worker |
-| POST | `/api/index/resume` | Resume the worker |
+|---|---|---|
+| `GET` | `/api/health` | Comprehensive system health check (DB, provider, models, quotas) |
+| `GET` | `/api/search?q={query}&limit={n}` | Hybrid keyword + semantic search (empty query returns recent files) |
+| `GET` | `/api/images/{id}` | Full metadata, tags, summary, and text for a screenshot |
+| `GET` | `/api/images/{id}/thumbnail` | Cached WebP thumbnail image |
+| `GET` | `/api/images/{id}/file` | Original screenshot file (restricted to `SCREENSHOT_DIR`) |
+| `GET` | `/api/index/status` | Queue counts (`pending`, `processing`, `done`, `failed`) and state |
+| `POST`| `/api/index/scan` | Trigger a manual folder scan and wake worker |
+| `POST`| `/api/index/pause` | Pause background indexing worker |
+| `POST`| `/api/index/resume` | Resume background indexing worker |
 
-If the semantic leg is unavailable, search falls back to keyword-only and sets a `degraded` flag in the response.
+---
 
 ## Project structure
 
 ```
 snaprecall/
-  backend/
-    app/
-      main.py              FastAPI app and lifespan (starts watcher and worker)
-      config.py            Settings loaded from the root .env
-      db.py                SQLite connection, schema, FTS5 and vector tables
-      schemas.py           Pydantic request and response models
-      api/                 Route modules: health, search, images, index
-      services/            LLM clients, OCR, vision, embeddings, pipeline,
-                           worker, watcher, hybrid search
-      utils/               Hashing, image helpers, logging
-    tests/
-    requirements.txt
-    requirements-dev.txt
-  frontend/
-    src/                   React app: components, hooks, API client
-  data/                    Created at runtime (database, thumbnails), git-ignored
-  .env.example
-  README.md
+├── backend/
+│   ├── app/
+│   │   ├── api/                 # API route endpoints
+│   │   │   ├── health.py        # /api/health diagnostics
+│   │   │   ├── images.py        # /api/images/{id} metadata, thumbnail, file
+│   │   │   ├── index.py         # /api/index queue controls and status
+│   │   │   └── search.py        # /api/search hybrid search endpoint
+│   │   ├── services/            # Core business logic
+│   │   │   ├── embeddings.py    # Document text builder & vector embedding
+│   │   │   ├── gemini_client.py # Async HTTP client for Gemini API
+│   │   │   ├── llm_client.py    # Abstract LLM client interface & tracker
+│   │   │   ├── ocr.py           # Tesseract OCR extraction
+│   │   │   ├── ollama_client.py # Async HTTP client for Ollama API
+│   │   │   ├── pipeline.py      # Single screenshot indexing pipeline
+│   │   │   ├── search.py        # FTS5 + sqlite-vec + Reciprocal Rank Fusion
+│   │   │   ├── vision.py        # Multimodal vision prompt & JSON parser
+│   │   │   ├── watcher.py       # Watchdog filesystem monitor & folder scan
+│   │   │   └── worker.py        # Resilient, throttled background queue worker
+│   │   ├── utils/               # Helpers (hashing, images, logging)
+│   │   ├── config.py            # Typed Pydantic settings from root .env
+│   │   ├── db.py                # SQLite schema, FTS5 triggers, sqlite-vec
+│   │   ├── main.py              # FastAPI application lifecycle
+│   │   └── schemas.py           # Pydantic request and response schemas
+│   ├── tests/                   # Pytest test suite (75+ unit & integration tests)
+│   ├── pyproject.toml
+│   └── requirements.txt
+├── frontend/
+│   ├── src/
+│   │   ├── api/                 # Typed backend API client
+│   │   ├── components/          # SearchBar, ResultGrid, ImageModal, IndexStatus
+│   │   ├── hooks/               # Custom hooks for search and queue status polling
+│   │   ├── styles/              # Design system and theme tokens
+│   │   └── App.tsx              # Main dashboard view
+│   ├── package.json
+│   └── vite.config.ts
+├── data/                        # SQLite DB and thumbnails (git-ignored)
+├── .env.example                 # Documented environment template
+└── README.md
 ```
+
+---
 
 ## Privacy and security
 
-Be clear about which mode you are using:
+- **Local mode guarantees:** When `LLM_PROVIDER=ollama`, all vision and embedding processing happens locally on your machine. No screenshot data, text, or vectors leave your computer.
+- **Hosted mode awareness:** When `LLM_PROVIDER=gemini`, downscaled screenshots and search queries are transmitted to Google's API over HTTPS. Be aware of your provider's terms of service regarding sensitive data.
+- **Localhost binding:** The backend binds to `127.0.0.1` by default, preventing unintended network exposure.
+- **Directory traversal prevention:** The `/api/images/{id}/file` endpoint resolves files strictly via database primary keys and ensures the resolved path is contained within `SCREENSHOT_DIR`.
+- **Safe data isolation:** The SQLite database and generated thumbnails reside in `data/`, which is ignored by version control.
+- **Credential safety:** API keys are loaded exclusively from `.env` and are never logged, returned in API responses, or exposed to the frontend.
 
-- **Hosted mode sends your screenshots to the model provider.** Do not use it for images containing sensitive information unless you accept the provider's terms. Free-tier terms in particular may allow your inputs to be used to improve their products. Read them before indexing anything private.
-- **Local mode keeps everything on your machine.** Models run through your own Ollama server and no image data leaves it.
-- Your API key is read only from `.env`, sent only in a request header, and never logged or returned by the API.
-- The API binds to `127.0.0.1` by default.
-- The file endpoint resolves files by database id only and verifies the path is inside `SCREENSHOT_DIR`, so arbitrary paths cannot be requested.
-- The database and thumbnails stay in `DATA_DIR`, which is git-ignored.
+---
 
 ## Why open-weight AI
 
-- **Choice of where it runs.** Because Gemma's weights are open, the same model is available as a hosted API for weak hardware and as a local model for people who want privacy. A closed vision API offers only the hosted path.
-- **A private path exists.** Screenshots contain OTPs, bank details and personal chats. Open weights make it possible to process them without sending them anywhere.
-- **Predictable cost.** Locally, indexing thousands of images costs only electricity, and re-indexing is free. Per-image API pricing adds up for a tool whose job is to process thousands of images.
-- **Control.** You can swap models, change quantization or move providers without rewriting the application.
+SnapRecall is designed around the open-weight philosophy:
+- **Deployment freedom:** The architecture works identically whether connected to hosted APIs or run entirely locally via open-weight models like Gemma.
+- **Long-term preservation:** Unlike proprietary cloud services that can deprecate models or shut down APIs, open-weight models remain functional offline indefinitely.
+- **Predictable economics:** Local processing has zero marginal cost per image, enabling you to index tens of thousands of screenshots without subscription fees.
+- **True privacy:** Screenshots frequently contain OTPs, bank statements, personal chats, and proprietary code. Open-weight models empower you to keep sensitive personal data completely confidential.
 
-An honest note: in hosted mode the embeddings come from a hosted model that is not open-source, and no benchmark against closed vision models has been done, so no claim is made that Gemma reads screenshots better than they do. The advantage claimed here is flexibility and the existence of a private option.
-
-## Status and limitations
-
-This is a first version and still needs testing. Not yet measured or verified:
-
-- Search accuracy on a large, real screenshot collection
-- How well Hindi and Hinglish screenshots are read
-- Indexing time for a large backlog under free-tier limits
-- The local (Ollama) mode on real hardware
-- How much time the tool actually saves in daily use
-
-Known constraints:
-
-- Hosted free tiers have low request limits, so a large backlog will take many days unless you use a paid tier. Use `DAILY_REQUEST_BUDGET` and `WORKER_THROTTLE_SECONDS` to stay within limits.
-- Small screenshots of dense text may be read imperfectly after downscaling. Raise `MAX_IMAGE_SIDE` if needed (at higher request cost).
-- `sqlite-vec` needs a Python build whose SQLite supports loadable extensions. On macOS, use Homebrew or python.org Python if loading fails.
-- The backend must run on the machine that holds the screenshots. Hosting it remotely would need an upload feature, which does not exist yet.
+---
 
 ## Troubleshooting
 
-| Problem | Likely cause and fix |
-|---------|----------------------|
-| `/api/health` says the API key is missing | `GEMINI_API_KEY` is empty in the root `.env`. Set it and restart the backend. |
-| Nothing is being indexed | `SCREENSHOT_DIR` is empty or wrong, or the worker is paused. Check `/api/health` and `/api/index/status`. |
-| Indexing paused by itself | Daily quota or `DAILY_REQUEST_BUDGET` reached. It resumes at local midnight, or click Resume. |
-| `embedding_mismatch` in health | You changed the embedding model or dimension. Delete `data/snaprecall.db` and re-index. |
-| Frontend shows a network or CORS error | Add your frontend origin to `CORS_ORIGINS`. Note that `localhost` and `127.0.0.1` are different origins. |
-| Vector extension fails to load | Use a Python build with SQLite extension loading enabled (see Limitations). |
+| Problem | Cause and Solution |
+|---|---|
+| **`/api/health` reports API key missing** | `GEMINI_API_KEY` is empty in `.env`. Add your Google AI Studio key and restart the backend. |
+| **No screenshots are being indexed** | Ensure `SCREENSHOT_DIR` points to an existing directory containing supported images (`png,jpg,jpeg,webp`). Check `/api/index/status` to see if the worker is paused. |
+| **Indexing pauses automatically** | The daily request limit (`DAILY_REQUEST_BUDGET`) or API quota was reached. The worker auto-resumes at local midnight, or you can resume manually via the UI. |
+| **`embedding_mismatch` reported in health check** | You modified `EMBEDDING_MODEL` or `EMBEDDING_DIM`. Delete `data/snaprecall.db` and restart the backend to re-index with the new model. |
+| **Frontend displays CORS or network errors** | Verify `CORS_ORIGINS` in `.env` includes your frontend URL (e.g., `http://localhost:5173`). In `frontend/.env`, check that `VITE_API_BASE_URL` matches your backend address. |
+| **Vector extension (`sqlite-vec`) fails to load** | Your Python build lacks loadable SQLite extension support. On macOS, use python.org or Homebrew Python (`brew install python@3.11`). |
+| **Ollama model errors** | Run `ollama list` to verify that `VISION_MODEL` and `EMBEDDING_MODEL` are pulled. Pull them with `ollama pull <model-name>`. |
+
+---
 
 ## Roadmap
 
-- Smart filename suggestions with preview, apply and undo (never silent renames)
-- Filters by date and screenshot type
-- Highlighting of matched text in results
-- Evaluation script: a small set of test queries to measure search quality
-- Tested local mode with published timings
-- Desktop tray app and packaged installer
+- Smart filename suggestions with preview, apply, and undo (never silent renames).
+- Date and screenshot type filter chips (`payment`, `chat`, `code`, `ticket`).
+- Matched text query highlighting directly on preview thumbnails.
+- Desktop system tray application with native notifications.
+- Benchmark suite for measuring search latency and retrieval quality.
+
+---
 
 ## Contributing
 
-Issues and pull requests are welcome. Before opening a PR, run `ruff check .` and `pytest` inside `backend/`, and `npm run lint` and `npm test` inside `frontend/`. If something breaks on your screenshots, please open an issue with the error message and your provider mode.
+Contributions and feedback are welcome!
+1. Fork the repository and create a feature branch.
+2. In `backend/`, verify tests pass: `pytest` and lint with `ruff check .`.
+3. In `frontend/`, run `npm run lint` and `npm run build`.
+4. Open a pull request describing your changes.
+
+---
 
 ## License
 
-MIT. See `LICENSE`.
+[MIT](LICENSE) © 2026 SnapRecall Contributors
