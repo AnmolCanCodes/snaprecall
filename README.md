@@ -4,6 +4,14 @@
 
 SnapRecall watches your screenshots folder, lets an AI model read every image in the background, and builds a searchable index. Instead of scrolling through thousands of files named `screenshot_2026-10-24-14-55-16.png`, you type "rahul payment 2500" or "docker permission error" and the matching screenshots appear.
 
+<div align="center">
+  <img src="SnapRecall Screenshot Search Hero.png" alt="SnapRecall — AI-powered screenshot search" width="100%" />
+
+  <p><strong>Find any screenshot by typing what you remember about it.</strong></p>
+
+  <p>AI-powered screenshot indexing · Hybrid search · English, Hindi & Hinglish</p>
+</div>
+
 Built for the Hacktoberfest DEV Challenge, Week 3 (theme: "Slow and Steady"). Gemma is the open-weight model at the core of the project.
 
 > **Status: first working version, still being tested.** The design and code are in place, but search quality, Hindi/Hinglish accuracy, large-backlog indexing time and the local (Ollama) mode have not been measured yet. See [Status and limitations](#status-and-limitations).
